@@ -1,0 +1,508 @@
+#include <Wire.h>
+#include <math.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+
+// =====================================================
+// SOMNI PROTOTYPE 1
+// XIAO ESP32-C6 + MAX30102 + LIS3DH-compatible sensor
+// Shared I2C: SDA = GPIO22, SCL = GPIO23
+// =====================================================
+
+#define SDA_PIN 22
+#define SCL_PIN 23
+#define ACCEL_ADDR 0x18
+
+MAX30105 particleSensor;
+
+bool maxReady = false;
+bool accelReady = false;
+
+// =====================================================
+// HEART RATE VARIABLES
+// =====================================================
+
+const byte RATE_SIZE = 8;
+byte rates[RATE_SIZE] = {0};
+byte rateSpot = 0;
+
+long lastBeat = 0;
+float beatsPerMinute = 0;
+int beatAvg = 0;
+
+// =====================================================
+// EXPERIMENTAL SpO2 ESTIMATE
+// This formula is not medically validated.
+// =====================================================
+
+long redMin = 0x7FFFFFFF;
+long redMax = 0;
+long irMin = 0x7FFFFFFF;
+long irMax = 0;
+
+int sampleCount = 0;
+const int SAMPLES_PER_WINDOW = 100;
+
+float currentSpo2 = 0;
+float spo2Sum = 0;
+int spo2ValidReadings = 0;
+
+// =====================================================
+// RECORDING VARIABLES
+// =====================================================
+
+unsigned long recordingStartTime = 0;
+bool fingerDetected = false;
+
+// =====================================================
+// ACCELEROMETER VARIABLES
+// =====================================================
+
+float accelX = 0;
+float accelY = 0;
+float accelZ = 0;
+
+float movementIntensityG = 0;
+
+float previousX = 0;
+float previousY = 0;
+float previousZ = 0;
+
+bool previousAccelAvailable = false;
+
+unsigned long lastAccelReadTime = 0;
+unsigned long lastAccelPrintTime = 0;
+
+const unsigned long ACCEL_INTERVAL_MS = 50;  // 20 Hz
+const unsigned long ACCEL_PRINT_MS = 1000;   // 1 second
+
+// =====================================================
+// LIS3DH REGISTER FUNCTIONS
+// =====================================================
+
+bool writeReg(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(ACCEL_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+  return Wire.endTransmission() == 0;
+}
+
+bool readRegs(uint8_t reg, uint8_t *data, uint8_t count) {
+  Wire.beginTransmission(ACCEL_ADDR);
+  Wire.write(reg | 0x80);  // Register auto-increment
+
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+
+  if (Wire.requestFrom(ACCEL_ADDR, count) != count) {
+    return false;
+  }
+
+  for (uint8_t i = 0; i < count; i++) {
+    data[i] = Wire.read();
+  }
+
+  return true;
+}
+
+// =====================================================
+// ACCELEROMETER INITIALIZATION
+// =====================================================
+
+void initializeAccelerometer() {
+  uint8_t id = 0;
+
+  if (!readRegs(0x0F, &id, 1)) {
+    Serial.println("ACCEL: Communication failed.");
+    return;
+  }
+
+  Serial.printf("ACCEL WHO_AM_I: 0x%02X\n", id);
+
+  if (id != 0x33) {
+    Serial.println("ACCEL: Unexpected chip ID.");
+    return;
+  }
+
+  // 100 Hz, normal mode, XYZ enabled
+  bool ctrl1OK = writeReg(0x20, 0x57);
+
+  // Block-data update, high-resolution, +/-2g
+  bool ctrl4OK = writeReg(0x23, 0x88);
+
+  if (!ctrl1OK || !ctrl4OK) {
+    Serial.println("ACCEL: Configuration failed.");
+    return;
+  }
+
+  accelReady = true;
+  Serial.println("ACCEL: Ready!");
+}
+
+// =====================================================
+// ACCELEROMETER READING AND MOVEMENT PROCESSING
+// =====================================================
+
+void readAccelerometer() {
+  uint8_t data[6];
+
+  if (!readRegs(0x28, data, 6)) {
+    Serial.println("ACCEL: Reading failed.");
+    return;
+  }
+
+  int16_t rawX = (int16_t)((data[1] << 8) | data[0]);
+  int16_t rawY = (int16_t)((data[3] << 8) | data[2]);
+  int16_t rawZ = (int16_t)((data[5] << 8) | data[4]);
+
+  // High-resolution values are left-justified 12-bit data
+  rawX >>= 4;
+  rawY >>= 4;
+  rawZ >>= 4;
+
+  // Approximate acceleration in g
+  accelX = rawX * 0.001f;
+  accelY = rawY * 0.001f;
+  accelZ = rawZ * 0.001f;
+
+  // Total acceleration magnitude
+  float magnitude = sqrtf(
+    accelX * accelX +
+    accelY * accelY +
+    accelZ * accelZ
+  );
+
+  // Account for changes in the individual axes as the
+  // device moves, as well as deviation from 1 g.
+  float axisChange = 0;
+
+  if (previousAccelAvailable) {
+    float dx = accelX - previousX;
+    float dy = accelY - previousY;
+    float dz = accelZ - previousZ;
+
+    axisChange = sqrtf(dx * dx + dy * dy + dz * dz);
+  }
+
+  float rawMovement =
+      fabsf(magnitude - 1.0f) + 0.5f * axisChange;
+
+  // Smooth the estimate so it does not jump excessively
+  if (!previousAccelAvailable) {
+    movementIntensityG = rawMovement;
+    previousAccelAvailable = true;
+  } else {
+    movementIntensityG =
+        0.2f * rawMovement + 0.8f * movementIntensityG;
+  }
+
+  previousX = accelX;
+  previousY = accelY;
+  previousZ = accelZ;
+}
+
+// Rough prototype categories, not validated activity detection
+const char* getMovementLabel() {
+  if (movementIntensityG < 0.08f) {
+    return "STILL/LOW";
+  } else if (movementIntensityG < 0.18f) {
+    return "LOW";
+  } else if (movementIntensityG < 0.35f) {
+    return "MODERATE";
+  } else {
+    return "HIGH";
+  }
+}
+
+// =====================================================
+// MAX30102 INITIALIZATION
+// =====================================================
+
+void initializeMAX30102() {
+  Serial.println("Initializing MAX30102...");
+
+  if (!particleSensor.begin(Wire, I2C_SPEED_STANDARD)) {
+    Serial.println("MAX30102: Sensor not found.");
+    return;
+  }
+
+  byte ledBrightness = 50;
+  byte sampleAverage = 1;
+  byte ledMode = 2;       // Red + IR
+  int sampleRate = 100;
+  int pulseWidth = 411;
+  int adcRange = 4096;
+
+  particleSensor.setup(
+    ledBrightness,
+    sampleAverage,
+    ledMode,
+    sampleRate,
+    pulseWidth,
+    adcRange
+  );
+
+  maxReady = true;
+  Serial.println("MAX30102: Ready!");
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+
+  Serial.println("\n==================================");
+  Serial.println("       SOMNI SENSOR SYSTEM        ");
+  Serial.println("==================================");
+
+  // Initialize I2C only ONCE for both sensors
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000);
+
+  initializeMAX30102();
+  initializeAccelerometer();
+
+  Serial.println("\n--- Initialization Summary ---");
+  Serial.printf("MAX30102: %s\n", maxReady ? "OK" : "FAILED");
+  Serial.printf("Accelerometer: %s\n",
+                accelReady ? "OK" : "FAILED");
+
+  Serial.println("\nACCEL,X_g,Y_g,Z_g,Motion_g,Activity");
+
+  if (maxReady) {
+    Serial.println(
+      "Place your finger gently on the MAX30102."
+    );
+  }
+}
+
+// =====================================================
+// MAIN LOOP
+// =====================================================
+
+void loop() {
+  unsigned long now = millis();
+
+  // ---------------------------------------------------
+  // 1. READ ACCELEROMETER
+  // ---------------------------------------------------
+
+  if (accelReady &&
+      now - lastAccelReadTime >= ACCEL_INTERVAL_MS) {
+
+    lastAccelReadTime = now;
+    readAccelerometer();
+  }
+
+  // Print the most recent movement measurements once/sec
+  if (accelReady &&
+      now - lastAccelPrintTime >= ACCEL_PRINT_MS) {
+
+    lastAccelPrintTime = now;
+
+    Serial.print("ACCEL,");
+    Serial.print(accelX, 3);
+    Serial.print(",");
+    Serial.print(accelY, 3);
+    Serial.print(",");
+    Serial.print(accelZ, 3);
+    Serial.print(",");
+    Serial.print(movementIntensityG, 3);
+    Serial.print(",");
+    Serial.println(getMovementLabel());
+  }
+
+  // ---------------------------------------------------
+  // 2. READ MAX30102
+  // ---------------------------------------------------
+
+  if (!maxReady) {
+    return;
+  }
+
+  particleSensor.check();
+
+  while (particleSensor.available()) {
+    long irValue = particleSensor.getFIFOIR();
+    long redValue = particleSensor.getFIFORed();
+
+    // -----------------------------------------------
+    // FINGER DETECTION
+    // -----------------------------------------------
+
+    if (irValue < 50000) {
+      if (fingerDetected) {
+        Serial.println("MAX30102: Finger removed.");
+      }
+
+      fingerDetected = false;
+      beatAvg = 0;
+
+      spo2Sum = 0;
+      spo2ValidReadings = 0;
+
+      // Reset the partial SpO2 window
+      sampleCount = 0;
+      redMin = 0x7FFFFFFF;
+      redMax = 0;
+      irMin = 0x7FFFFFFF;
+      irMax = 0;
+
+      particleSensor.nextSample();
+      continue;
+    }
+
+    if (!fingerDetected) {
+      fingerDetected = true;
+      recordingStartTime = millis();
+
+      // Start the next recording without old samples
+      spo2Sum = 0;
+      spo2ValidReadings = 0;
+      Serial.println(
+        "MAX30102: Finger detected. Collecting data..."
+      );
+    }
+
+    // -----------------------------------------------
+    // HEART-RATE CALCULATION
+    // -----------------------------------------------
+
+    if (checkForBeat(irValue)) {
+      long currentTime = millis();
+      long delta = currentTime - lastBeat;
+      lastBeat = currentTime;
+
+      if (delta > 0) {
+        float currentBPM = 60000.0f / delta;
+
+        if (currentBPM >= 40.0f &&
+            currentBPM <= 200.0f) {
+
+          beatsPerMinute = currentBPM;
+          rates[rateSpot++] = (byte)beatsPerMinute;
+          rateSpot %= RATE_SIZE;
+
+          int rateSum = 0;
+          int validRates = 0;
+
+          for (byte i = 0; i < RATE_SIZE; i++) {
+            if (rates[i] > 0) {
+              rateSum += rates[i];
+              validRates++;
+            }
+          }
+
+          if (validRates > 0) {
+            beatAvg = rateSum / validRates;
+          }
+        }
+      }
+    }
+
+    // -----------------------------------------------
+    // EXPERIMENTAL SpO2 ESTIMATE
+    // -----------------------------------------------
+
+    if (redValue < redMin) redMin = redValue;
+    if (redValue > redMax) redMax = redValue;
+    if (irValue < irMin) irMin = irValue;
+    if (irValue > irMax) irMax = irValue;
+
+    sampleCount++;
+
+    if (sampleCount >= SAMPLES_PER_WINDOW) {
+      double redAC = redMax - redMin;
+      double redDC = (redMax + redMin) / 2.0;
+
+      double irAC = irMax - irMin;
+      double irDC = (irMax + irMin) / 2.0;
+
+      if (irDC > 0 && redDC > 0 && irAC > 0) {
+        double R =
+          (redAC / redDC) / (irAC / irDC);
+
+        float calculatedSpo2 = 104.0f - (17.0f * R);
+
+        // Restrict the experimental estimate
+        if (calculatedSpo2 > 100.0f) {
+          calculatedSpo2 = 100.0f;
+        }
+
+        if (calculatedSpo2 < 70.0f) {
+          calculatedSpo2 = 70.0f;
+        }
+
+        currentSpo2 = calculatedSpo2;
+
+        if (currentSpo2 > 80.0f) {
+          spo2Sum += currentSpo2;
+          spo2ValidReadings++;
+        }
+      }
+
+      // Begin a new calculation window
+      redMin = 0x7FFFFFFF;
+      redMax = 0;
+      irMin = 0x7FFFFFFF;
+      irMax = 0;
+      sampleCount = 0;
+    }
+
+    particleSensor.nextSample();
+  }
+
+  // ---------------------------------------------------
+  // 3. PRINT THE 20-SECOND HEALTH RECORD
+  // ---------------------------------------------------
+
+  if (fingerDetected &&
+      millis() - recordingStartTime >= 20000) {
+
+    float finalSpo2Avg = 0;
+
+    if (spo2ValidReadings > 0) {
+      finalSpo2Avg = spo2Sum / spo2ValidReadings;
+    }
+
+    Serial.println("\n");
+    Serial.println("==================================");
+    Serial.println("     SOMNI HEALTH DATA TEST       ");
+    Serial.println("==================================");
+
+    if (beatAvg > 0) {
+      Serial.print("Smoothed heart rate: ");
+      Serial.print(beatAvg);
+      Serial.println(" BPM");
+    } else {
+      Serial.println("Heart rate: Still calculating");
+    }
+
+    if (finalSpo2Avg > 0) {
+      Serial.print("Experimental SpO2 estimate: ");
+      Serial.print(finalSpo2Avg, 1);
+      Serial.println("%");
+    } else {
+      Serial.println("SpO2 estimate: Insufficient data");
+    }
+
+    if (accelReady) {
+      Serial.print("Movement intensity: ");
+      Serial.print(movementIntensityG, 3);
+      Serial.println(" g");
+
+      Serial.print("Movement category: ");
+      Serial.println(getMovementLabel());
+    }
+
+    Serial.println("==================================\n");
+
+    recordingStartTime = millis();
+    spo2Sum = 0;
+    spo2ValidReadings = 0;
+  }
+}
